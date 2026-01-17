@@ -105,7 +105,15 @@ impl StagedAIG {
                 unrealized_endpoint_nodes.push(i);
             });
         }
-        assert!(!unrealized_endpoint_nodes.is_empty());
+        if unrealized_endpoint_nodes.is_empty() {
+            return Self {
+                primary_inputs: primary_inputs.map(|v| v.clone()),
+                primary_output_pins: Vec::new(),
+                endpoints: unrealized_orig_endpoints.iter().copied().collect(),
+            }
+        }
+
+
         let order = aig.topo_traverse_generic(
             Some(&unrealized_endpoint_nodes),
             primary_inputs

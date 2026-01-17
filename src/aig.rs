@@ -144,6 +144,8 @@ pub struct AIG {
     pub fanouts_start: Vec<usize>,
     /// The fanout CSR array.
     pub fanouts: Vec<usize>,
+    /// Reverse mapping from AIG pin to NetlistDB pin (representative).
+    pub pin_map: Vec<usize>,
 }
 
 impl AIG {
@@ -233,7 +235,7 @@ impl AIG {
         }
         for ipin in netlistdb.cell2pin.iter_set(cellid) {
             if netlistdb.pindirect[ipin] == Direction::I {
-                match netlistdb.pinnames[ipin].1.as_str() {
+                match netlistdb.pin_name(ipin).1.as_str() {
                     "A" => pin_a = ipin,
                     "CP" => pin_cp = ipin,
                     "E" => pin_en = ipin,
@@ -294,7 +296,7 @@ impl AIG {
     ) {
         if topo_instack[pinid] {
             panic!("circuit has a loop around pin {}",
-                   netlistdb.pinnames[pinid].dbg_fmt_pin());
+                   netlistdb.pin_name(pinid).dbg_fmt_pin());
         }
         if topo_vis[pinid] {
             return
@@ -320,6 +322,7 @@ impl AIG {
                     root
                 );
                 self.pin2aigpin_iv[pinid] = self.pin2aigpin_iv[root];
+
                 if cellid == 0 {
                     self.primary_outputs.insert(self.pin2aigpin_iv[pinid]);
                 }
@@ -335,25 +338,29 @@ impl AIG {
             let q = self.add_aigpin(DriverType::DFF(cellid));
             let dff = self.dffs.entry(cellid).or_default();
             dff.q = q;
-            let mut ap_s_iv = 1;
-            let mut ap_r_iv = 1;
+            let mut ap_s_iv = usize::MAX;
+            let mut ap_r_iv = usize::MAX;
             let mut q_out = q << 1;
             for pinid in netlistdb.cell2pin.iter_set(cellid) {
-                if !matches!(netlistdb.pinnames[pinid].1.as_str(), "S" | "R") {
+                if !matches!(netlistdb.pin_name(pinid).1.as_str(), "S" | "R") {
                     continue
                 }
                 self.dfs_netlistdb_build_aig(
                     netlistdb, topo_vis, topo_instack, pinid
                 );
                 let prev = self.pin2aigpin_iv[pinid];
-                match netlistdb.pinnames[pinid].1.as_str() {
+                match netlistdb.pin_name(pinid).1.as_str() {
                     "S" => ap_s_iv = prev,
                     "R" => ap_r_iv = prev,
                     _ => unreachable!()
                 }
             }
-            q_out = self.add_and_gate(q_out ^ 1, ap_s_iv) ^ 1;
-            q_out = self.add_and_gate(q_out, ap_r_iv);
+            if ap_s_iv != usize::MAX {
+                q_out = self.add_and_gate(q_out ^ 1, ap_s_iv ^ 1) ^ 1;
+            }
+            if ap_r_iv != usize::MAX {
+                q_out = self.add_and_gate(q_out, ap_r_iv ^ 1);
+            }
             self.pin2aigpin_iv[pinid] = q_out;
         }
         else if celltype == "LATCH" {
@@ -367,16 +374,16 @@ impl AIG {
         else if celltype == "$__RAMGEM_SYNC_" {
             let o = self.add_aigpin(DriverType::SRAM(cellid));
             self.pin2aigpin_iv[pinid] = o << 1;
-            assert_eq!(netlistdb.pinnames[pinid].1.as_str(),
+            assert_eq!(netlistdb.pin_name(pinid).1.as_str(),
                        "PORT_R_RD_DATA");
             let sram = self.srams.entry(cellid).or_default();
-            sram.port_r_rd_data[netlistdb.pinnames[pinid].2.unwrap() as usize] = o;
+            sram.port_r_rd_data[netlistdb.pin_name(pinid).2.unwrap() as usize] = o;
         }
         else if celltype == "CKLNQD" {
             let mut prev_cp = usize::MAX;
             let mut prev_en = usize::MAX;
             for pinid in netlistdb.cell2pin.iter_set(cellid) {
-                match netlistdb.pinnames[pinid].1.as_str() {
+                match netlistdb.pin_name(pinid).1.as_str() {
                     "CP" => prev_cp = pinid,
                     "E" => prev_en = pinid,
                     _ => {}
@@ -396,7 +403,7 @@ impl AIG {
             let mut prev_a = usize::MAX;
             let mut prev_b = usize::MAX;
             for pinid in netlistdb.cell2pin.iter_set(cellid) {
-                match netlistdb.pinnames[pinid].1.as_str() {
+                match netlistdb.pin_name(pinid).1.as_str() {
                     "A" => prev_a = pinid,
                     "B" => prev_b = pinid,
                     _ => {}
@@ -414,14 +421,20 @@ impl AIG {
                 "AND2_00_0" | "AND2_01_0" | "AND2_10_0" | "AND2_11_0" | "AND2_11_1" => {
                     assert_ne!(prev_a, usize::MAX);
                     assert_ne!(prev_b, usize::MAX);
-                    let name = netlistdb.celltypes[cellid].as_bytes();
-                    let iv_a = name[5] - b'0';
-                    let iv_b = name[6] - b'0';
-                    let iv_y = name[8] - b'0';
-                    let apid = self.add_and_gate(
-                        self.pin2aigpin_iv[prev_a] ^ (iv_a as usize),
-                        self.pin2aigpin_iv[prev_b] ^ (iv_b as usize),
-                    ) ^ (iv_y as usize);
+                    // Match polarity to aigpdk.lib
+                    // AND2_11_1: (A * B)
+                    // AND2_00_0: (A + B) = !(!A * !B)
+                    let apid = if celltype == "AND2_11_1" {
+                        self.add_and_gate(
+                            self.pin2aigpin_iv[prev_a],
+                            self.pin2aigpin_iv[prev_b],
+                        )
+                    } else {
+                         self.add_and_gate(
+                            self.pin2aigpin_iv[prev_a] ^ 1,
+                            self.pin2aigpin_iv[prev_b] ^ 1,
+                        ) ^ 1
+                    };
                     self.pin2aigpin_iv[pinid] = apid;
                 },
                 "INV" => {
@@ -439,6 +452,7 @@ impl AIG {
     }
 
     pub fn from_netlistdb(netlistdb: &NetlistDB) -> AIG {
+        use netlistdb::GeneralHierName;
         let mut aig = AIG {
             num_aigpins: 0,
             pin2aigpin_iv: vec![usize::MAX; netlistdb.num_pins],
@@ -452,7 +466,7 @@ impl AIG {
                 continue
             }
             for pinid in netlistdb.cell2pin.iter_set(cellid) {
-                if !matches!(netlistdb.pinnames[pinid].1.as_str(),
+                if !matches!(netlistdb.pin_name(pinid).1.as_str(),
                             "CLK" | "PORT_R_CLK" | "PORT_W_CLK") {
                     continue
                 }
@@ -466,14 +480,14 @@ impl AIG {
                             that clocks this sequential element. \
                             Clock gating need to be manually patched atm.",
                            netlistdb.cellnames[cellid].dbg_fmt_hier(),
-                           netlistdb.pinnames[pinid].dbg_fmt_pin());
+                           netlistdb.pin_name(pinid).dbg_fmt_pin());
                 }
             }
         }
         for (&clk, &(flagr, flagf)) in &aig.clock_pin2aigpins {
             clilog::info!(
                 "inferred clock port {} ({})",
-                netlistdb.pinnames[clk].dbg_fmt_pin(),
+                netlistdb.pin_name(clk).dbg_fmt_pin(),
                 match (flagr, flagf) {
                     (_, usize::MAX) => "posedge",
                     (usize::MAX, _) => "negedge",
@@ -493,14 +507,16 @@ impl AIG {
         }
 
         for cellid in 0..netlistdb.num_cells {
-            if matches!(netlistdb.celltypes[cellid].as_str(), "DFF" | "DFFSR") {
-                let mut ap_s_iv = 1;
-                let mut ap_r_iv = 1;
+            let ctype = netlistdb.celltypes[cellid].as_str();
+            if matches!(ctype, "DFF" | "DFFSR") {
+                clilog::debug!("Found DFF cell: {} type={}", netlistdb.cellnames[cellid].dbg_fmt_hier(), ctype);
+                let mut ap_s_iv = usize::MAX;
+                let mut ap_r_iv = usize::MAX;
                 let mut ap_d_iv = 0;
                 let mut ap_clken_iv = 0;
                 for pinid in netlistdb.cell2pin.iter_set(cellid) {
                     let pin_iv = aig.pin2aigpin_iv[pinid];
-                    match netlistdb.pinnames[pinid].1.as_str() {
+                    match netlistdb.pin_name(pinid).1.as_str() {
                         "D" => ap_d_iv = pin_iv,
                         "S" => ap_s_iv = pin_iv,
                         "R" => ap_r_iv = pin_iv,
@@ -513,22 +529,26 @@ impl AIG {
                 }
                 let mut d_in = ap_d_iv;
 
-                d_in = aig.add_and_gate(d_in ^ 1, ap_s_iv) ^ 1;
-                ap_clken_iv = aig.add_and_gate(ap_clken_iv ^ 1, ap_s_iv) ^ 1;
-                d_in = aig.add_and_gate(d_in, ap_r_iv);
-                ap_clken_iv = aig.add_and_gate(ap_clken_iv ^ 1, ap_r_iv) ^ 1;
+                if ap_s_iv != usize::MAX {
+                    d_in = aig.add_and_gate(d_in ^ 1, ap_s_iv ^ 1) ^ 1;
+                    ap_clken_iv = aig.add_and_gate(ap_clken_iv ^ 1, ap_s_iv ^ 1) ^ 1;
+                }
+                if ap_r_iv != usize::MAX {
+                    d_in = aig.add_and_gate(d_in, ap_r_iv ^ 1);
+                    ap_clken_iv = aig.add_and_gate(ap_clken_iv ^ 1, ap_r_iv ^ 1) ^ 1;
+                }
                 let dff = aig.dffs.entry(cellid).or_default();
                 dff.en_iv = ap_clken_iv;
                 dff.d_iv = d_in;
                 assert_ne!(dff.q, 0);
             }
-            else if netlistdb.celltypes[cellid].as_str() == "$__RAMGEM_SYNC_" {
+            else if ctype == "$__RAMGEM_SYNC_" {
                 let mut sram = aig.srams.entry(cellid).or_default().clone();
                 let mut write_clken_iv = 0;
                 for pinid in netlistdb.cell2pin.iter_set(cellid) {
-                    let bit = netlistdb.pinnames[pinid].2.map(|i| i as usize);
+                    let bit = netlistdb.pin_name(pinid).2.map(|i| i as usize);
                     let pin_iv = aig.pin2aigpin_iv[pinid];
-                    match netlistdb.pinnames[pinid].1.as_str() {
+                    match netlistdb.pin_name(pinid).1.as_str() {
                         "PORT_R_ADDR" => {
                             sram.port_r_addr_iv[bit.unwrap()] = pin_iv;
                         },
@@ -565,7 +585,11 @@ impl AIG {
                 }
                 *aig.srams.get_mut(&cellid).unwrap() = sram;
             }
-        }
+       }
+       
+       clilog::info!("AIG Build Check: DFFs detected: {}, SRAMs detected: {}", aig.dffs.len(), aig.srams.len());
+       
+
 
         aig.fanouts_start = vec![0; aig.num_aigpins + 2];
         for (_i, driver) in aig.drivers.iter().enumerate() {
@@ -597,21 +621,33 @@ impl AIG {
             }
         }
 
+        aig.pin_map = vec![usize::MAX; aig.num_aigpins + 1];
+        for (pin, &aig_iv) in aig.pin2aigpin_iv.iter().enumerate() {
+            if aig_iv != usize::MAX {
+                let fs = aig_iv >> 1;
+                if fs <= aig.num_aigpins {
+                    aig.pin_map[fs] = pin;
+                }
+            }
+        }
+
+        clilog::info!("AIG Stats: {} POs, {} DFFs, {} SRAMs. Total endpoints: {}", 
+                 aig.primary_outputs.len(), aig.dffs.len(), aig.srams.len(), aig.num_endpoint_groups());
         aig
     }
 
     pub fn topo_traverse_generic(
         &self,
-        endpoints: Option<&Vec<usize>>,
+        endpoints: Option<&[usize]>,
         is_primary_input: Option<&IndexSet<usize>>,
     ) -> Vec<usize> {
-        let mut vis = IndexSet::new();
+        let mut vis = vec![0u8; self.num_aigpins + 1];
         let mut ret = Vec::new();
-        fn dfs_topo(aig: &AIG, vis: &mut IndexSet<usize>, ret: &mut Vec<usize>, is_primary_input: Option<&IndexSet<usize>>, u: usize) {
-            if vis.contains(&u) {
+        fn dfs_topo(aig: &AIG, vis: &mut [u8], ret: &mut Vec<usize>, is_primary_input: Option<&IndexSet<usize>>, u: usize) {
+            if vis[u] == 1 {
                 return
             }
-            vis.insert(u);
+            vis[u] = 1;
             if let DriverType::AndGate(a, b) = aig.drivers[u] {
                 if is_primary_input.map(|s| s.contains(&u)) != Some(true) {
                     if (a >> 1) != 0 {
@@ -646,7 +682,7 @@ impl AIG {
             EndpointGroup::PrimaryOutput(*self.primary_outputs.get_index(endpt_id).unwrap())
         }
         else if endpt_id < self.primary_outputs.len() + self.dffs.len() {
-            EndpointGroup::DFF(&self.dffs[endpt_id - self.primary_outputs.len()])
+            EndpointGroup::DFF(&self.dffs.get_index(endpt_id - self.primary_outputs.len()).unwrap().1)
         }
         else {
             EndpointGroup::RAMBlock(&self.srams[endpt_id - self.primary_outputs.len() - self.dffs.len()])
