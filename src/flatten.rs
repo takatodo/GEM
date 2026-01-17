@@ -4,13 +4,12 @@
 
 use crate::aig::{AIG, EndpointGroup, DriverType};
 use crate::aigpdk::AIGPDK_SRAM_ADDR_WIDTH;
-use crate::pe::{Partition, BOOMERANG_NUM_STAGES};
+use crate::pe::Partition;
 use crate::staging::StagedAIG;
 use indexmap::IndexMap;
 use std::collections::BTreeMap;
 use ulib::UVec;
-
-pub const NUM_THREADS_V1: usize = 1 << (BOOMERANG_NUM_STAGES - 5);
+// BOOMERANG_NUM_STAGES and NUM_THREADS_V1 removed to support runtime configuration.
 
 /// A flattened script, for partition executor version 1.
 /// See [FlattenedScriptV1::blocks_data] for the format details.
@@ -18,6 +17,7 @@ pub const NUM_THREADS_V1: usize = 1 << (BOOMERANG_NUM_STAGES - 5);
 /// Generally, a script contains a number of major stages.
 /// Each stage consists of the same number of blocks.
 /// Each block contains a list of flattened partitions.
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct FlattenedScriptV1 {
     /// the number of blocks
     pub num_blocks: usize,
@@ -108,7 +108,8 @@ pub struct FlattenedScriptV1 {
 }
 
 fn map_global_read_to_rounds(
-    inputs_taken: &BTreeMap<u32, u32>
+    inputs_taken: &BTreeMap<u32, u32>,
+    num_threads: usize,
 ) -> Vec<Vec<(u32, u32)>> {
     let inputs_taken = inputs_taken.iter()
         .map(|(&a, &b)| (a, b)).collect::<Vec<_>>();
@@ -117,11 +118,11 @@ fn map_global_read_to_rounds(
     let mut chunk_size = inputs_taken.len();
     while chunk_size >= 1 {
         let mut slices = inputs_taken.chunks(chunk_size).collect::<Vec<_>>();
-        slices.sort_by_cached_key(|&slice| {
+        slices.sort_by_cached_key(|slice: &&[(u32, u32)]| {
             u32::MAX - slice.iter()
-                .map(|(_, mask)| mask.count_ones()).sum::<u32>()
+                .map(|(_, mask): &(u32, u32)| mask.count_ones()).sum::<u32>()
         });
-        let mut rounds_idx_masks: Vec<Vec<(u32, u32)>> = vec![vec![]; NUM_THREADS_V1];
+        let mut rounds_idx_masks: Vec<Vec<(u32, u32)>> = vec![vec![]; num_threads];
         let mut round_map_j = 0;
         let mut fail = false;
         for slice in slices {
@@ -129,7 +130,7 @@ fn map_global_read_to_rounds(
                 let wrap_fail_j = round_map_j;
                 while rounds_idx_masks[round_map_j].iter().map(|(_, mask)| mask.count_ones()).sum::<u32>() + mask.count_ones() > 32 {
                     round_map_j += 1;
-                    if round_map_j == NUM_THREADS_V1 {
+                    if round_map_j == num_threads {
                         round_map_j = 0;
                     }
                     if round_map_j == wrap_fail_j {
@@ -141,7 +142,7 @@ fn map_global_read_to_rounds(
                 if fail { break }
                 rounds_idx_masks[round_map_j].push((offset, mask));
                 round_map_j += 1;
-                if round_map_j == NUM_THREADS_V1 {
+                if round_map_j == num_threads {
                     round_map_j = 0;
                 }
             }
@@ -227,12 +228,12 @@ fn set_bit_in_u32(v: &mut u32, pos: u32, bit: u8) {
 
 impl FlatteningPart {
     fn init_afters_writeouts(
-        &mut self, aig: &AIG, staged: &StagedAIG, part: &Partition
+        &mut self, aig: &AIG, staged: &StagedAIG, part: &Partition, num_stages: usize
     ) {
         let afters = part.stages.iter().map(|s| {
-            let mut after = Vec::with_capacity(1 << BOOMERANG_NUM_STAGES);
+            let mut after = Vec::with_capacity(1 << num_stages);
             after.push(usize::MAX);
-            for i in (1..=BOOMERANG_NUM_STAGES).rev() {
+            for i in (1..=num_stages).rev() {
                 after.extend(s.hier[i].iter().copied());
             }
             after
@@ -277,7 +278,7 @@ impl FlatteningPart {
         }
         self.num_duplicate_writeouts = ((
             comb_outputs_activations.values()
-                .map(|v| v.len() - 1).sum::<usize>()
+                .map(|v: &IndexMap<usize, Option<u16>>| v.len() - 1).sum::<usize>()
                 + 31) / 32) as u32;
         self.comb_outputs_activations = comb_outputs_activations;
 
@@ -336,11 +337,15 @@ impl FlatteningPart {
         }
         let (clken_iv_perm, clken_iv_inv, clken_iv_set0) = self.query_permute_with_pin_iv(clken_iv);
         let origpos = match self.after_writeout_pin2pos.get(&(pin_iv >> 1)) {
-            Some(origpos) => *origpos,
+            Some(origpos) => *origpos as usize,
             None => {
-                panic!("position of pin_iv {} (clken_iv {}) not found.. buggy boomerang, check if netlist and gemparts mismatch.", pin_iv, clken_iv)
+                if pin_iv <= 1 {
+                    0
+                } else {
+                    panic!("position of pin_iv {} (clken_iv {}) not found.. buggy boomerang, check if netlist and gemparts mismatch.", pin_iv, clken_iv)
+                }
             }
-        } as usize;
+        };
         let r_pos = if activ_idx == 0 {
             self.place_clken_datainv(
                 origpos, clken_iv_perm, clken_iv_inv, clken_iv_set0, (pin_iv & 1) as u8
@@ -376,14 +381,16 @@ impl FlatteningPart {
         input_map: &mut IndexMap<usize, u32>,
         staged_io_map: &mut IndexMap<usize, u32>,
         output_map: &mut IndexMap<usize, u32>,
+        num_stages: usize,
     ) {
-        self.sram_duplicate_permute = vec![0; 1 << BOOMERANG_NUM_STAGES];
-        self.sram_duplicate_inv = vec![0u32; NUM_THREADS_V1];
-        self.sram_duplicate_set0 = vec![u32::MAX; NUM_THREADS_V1];
-        self.clken_permute = vec![0; 1 << BOOMERANG_NUM_STAGES];
-        self.clken_inv = vec![0u32; NUM_THREADS_V1];
-        self.clken_set0 = vec![u32::MAX; NUM_THREADS_V1];
-        self.data_inv = vec![0u32; NUM_THREADS_V1];
+        let num_threads = 1 << (num_stages - 5);
+        self.sram_duplicate_permute = vec![0; 1 << num_stages];
+        self.sram_duplicate_inv = vec![0u32; num_threads];
+        self.sram_duplicate_set0 = vec![u32::MAX; num_threads];
+        self.clken_permute = vec![0; 1 << num_stages];
+        self.clken_inv = vec![0u32; num_threads];
+        self.clken_set0 = vec![u32::MAX; num_threads];
+        self.data_inv = vec![0u32; num_threads];
         self.cnt_placed_duplicate_permute = 0;
 
         let mut cur_sram_id = 0;
@@ -468,7 +475,9 @@ impl FlatteningPart {
         &self, aig: &AIG, part: &Partition,
         input_map: &IndexMap<usize, u32>,
         staged_io_map: &IndexMap<usize, u32>,
+        num_stages: usize,
     ) -> Vec<u32> {
+        let num_threads = 1 << (num_stages - 5);
         let mut script = Vec::<u32>::new();
 
         // metadata
@@ -480,8 +489,9 @@ impl FlatteningPart {
         script.push(self.sram_start);
         script.push(0);   // [6]=num global read rounds, assigned later
         script.push(self.num_duplicate_writeouts);
-        // padding
-        while script.len() < 128 {
+        // padding (first quarter of script)
+        let metadata_size = num_threads / 2;
+        while script.len() < metadata_size {
             script.push(0);
         }
         // final 128: write-out locations
@@ -502,7 +512,7 @@ impl FlatteningPart {
         if last_wo != u32::MAX {
             script.push(last_wo | (((1 << 16) - 1) << 16));
         }
-        while script.len() < 256 {
+        while script.len() < num_threads {
             script.push(u32::MAX);
         }
         // read global (256x32)
@@ -533,18 +543,18 @@ impl FlatteningPart {
         //     inputs_taken.iter().map(|(id, val)| format!("{}[{}]", id, val.count_ones())).collect::<Vec<_>>()
         // );
         let rounds_idx_masks = map_global_read_to_rounds(
-            &inputs_taken
+            &inputs_taken, num_threads
         );
         let num_global_stages = rounds_idx_masks.iter()
             .map(|v| v.len()).max().unwrap() as u32;
         script[6] = num_global_stages;
-        assert_eq!(script.len(), NUM_THREADS_V1);
+        assert_eq!(script.len(), num_threads);
         let global_perm_start = script.len();
-        script.extend((0..(2 * num_global_stages as usize * NUM_THREADS_V1)).map(|_| 0));
+        script.extend((0..(2 * num_global_stages as usize * num_threads)).map(|_| 0));
         for (i, v) in rounds_idx_masks.iter().enumerate() {
             for (round, &(idx, mask)) in v.iter().enumerate() {
-                script[global_perm_start + NUM_THREADS_V1 * 2 * round + (i * 2)] = idx;
-                script[global_perm_start + NUM_THREADS_V1 * 2 * round + (i * 2 + 1)] = mask;
+                script[global_perm_start + num_threads * 2 * round + (i * 2)] = idx;
+                script[global_perm_start + num_threads * 2 * round + (i * 2 + 1)] = mask;
                 // println!("test: round {} i {} idx {} mask {}",
                 //          round, i, idx, mask);
             }
@@ -584,9 +594,9 @@ impl FlatteningPart {
                 else { *last_pin2localpos.get(&pin).unwrap() }
             }).collect::<Vec<_>>();
 
-            let mut bs_xora = vec![0u32; NUM_THREADS_V1];
-            let mut bs_xorb = vec![0u32; NUM_THREADS_V1];
-            let mut bs_orb = vec![0u32; NUM_THREADS_V1];
+            let mut bs_xora = vec![0u32; num_threads];
+            let mut bs_xorb = vec![0u32; num_threads];
+            let mut bs_orb = vec![0u32; num_threads];
             for hi in 1..bs.hier.len() {
                 let hi_len = bs.hier[hi].len();
                 for j in 0..hi_len {
@@ -627,17 +637,17 @@ impl FlatteningPart {
                                 (bs_perm[i + 7] as u32) << 16);
                 }
             }
-            for i in 0..NUM_THREADS_V1 {
+            for i in 0..num_threads {
                 script.push(bs_xora[i]);
                 script.push(bs_xorb[i]);
                 script.push(bs_orb[i]);
                 script.push(0);
             }
 
-            last_pin2localpos = self.afters[bs_i].iter().enumerate().filter_map(|(i, &pin)| {
+            last_pin2localpos = self.afters[bs_i].iter().enumerate().filter_map(|(i, &pin): (usize, &usize)| {
                 if pin == usize::MAX { None }
                 else { Some((pin, i as u16)) }
-            }).collect::<IndexMap<_, _>>();
+            }).collect::<IndexMap<usize, u16>>();
         }
 
         // sram worker
@@ -653,7 +663,7 @@ impl FlatteningPart {
                             (self.sram_duplicate_permute[i + 7] as u32) << 16);
             }
         }
-        for i in 0..NUM_THREADS_V1 {
+        for i in 0..num_threads {
             script.push(self.sram_duplicate_inv[i]);
             script.push(self.sram_duplicate_set0[i]);
             script.push(0);
@@ -672,7 +682,7 @@ impl FlatteningPart {
                             (self.clken_permute[i + 7] as u32) << 16);
             }
         }
-        for i in 0..NUM_THREADS_V1 {
+        for i in 0..num_threads {
             script.push(self.clken_inv[i]);
             script.push(self.clken_set0[i]);
             script.push(self.data_inv[i]);
@@ -687,7 +697,8 @@ fn build_flattened_script_v1(
     aig: &AIG, stageds: &[&StagedAIG],
     parts_in_stages: &[&[Partition]],
     num_blocks: usize,
-    input_layout: Vec<usize>
+    input_layout: Vec<usize>,
+    num_stages: usize,
 ) -> FlattenedScriptV1 {
     // determine the output position.
     // this is the prerequisite for generating the read
@@ -761,7 +772,7 @@ fn build_flattened_script_v1(
         // basic index preprocessing for stages
         for i in 0..init_parts.len() {
             flattening_parts[i].init_afters_writeouts(
-                aig, staged, &init_parts[i]);
+                aig, staged, &init_parts[i], num_stages);
         }
 
         // allocate output state positions for all srams,
@@ -783,7 +794,8 @@ fn build_flattened_script_v1(
             // clilog::debug!("initializing output for part {}", part_id);
             flattening_parts[part_id].make_inputs_outputs(
                 aig, staged, &init_parts[part_id],
-                &mut input_map, &mut staged_io_map, &mut output_map
+                &mut input_map, &mut staged_io_map, &mut output_map,
+                num_stages
             );
         }
         stages_blocks_parts.push(blocks_parts);
@@ -800,14 +812,15 @@ fn build_flattened_script_v1(
         for part_id in 0..init_parts.len() {
             // clilog::debug!("building script for part {}", part_id);
             parts_data_split[part_id] = flattening_parts[part_id].build_script(
-                aig, &init_parts[part_id], &input_map, &staged_io_map
+                aig, &init_parts[part_id], &input_map, &staged_io_map, num_stages
             );
         }
 
         for block_id in 0..num_blocks {
             blocks_start.push(blocks_data.len());
             if blocks_parts[block_id].is_empty() {
-                let mut dummy = vec![0; NUM_THREADS_V1];
+                let num_threads = 1 << (num_stages - 5);
+                let mut dummy = vec![0; num_threads];
                 dummy[1] = 1;
                 blocks_data.extend(dummy.into_iter());
             }
@@ -826,7 +839,8 @@ fn build_flattened_script_v1(
         }
     }
     blocks_start.push(blocks_data.len());
-    blocks_data.extend((0..NUM_THREADS_V1 * 8).map(|_| 0)); // padding
+    let num_threads = 1 << (num_stages - 5);
+    blocks_data.extend((0..num_threads * 8).map(|_| 0)); // padding
 
     clilog::info!("Built script for {} blocks, reg/io state size {}, sram size {}, script size {}",
                   num_blocks, sum_state_start, sum_srams_start, blocks_data.len());
@@ -863,9 +877,10 @@ impl FlattenedScriptV1 {
         aig: &AIG, stageds: &[&StagedAIG],
         parts_in_stages: &[&[Partition]],
         num_blocks: usize,
-        input_layout: Vec<usize>
+        input_layout: Vec<usize>,
+        num_stages: usize,
     ) -> FlattenedScriptV1 {
         build_flattened_script_v1(
-            aig, stageds, parts_in_stages, num_blocks, input_layout)
+            aig, stageds, parts_in_stages, num_blocks, input_layout, num_stages)
     }
 }
