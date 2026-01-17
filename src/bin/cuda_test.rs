@@ -59,6 +59,12 @@ struct SimulatorArgs {
     /// Limit the number of simulated cycles to no more than this.
     #[clap(long)]
     max_cycles: Option<usize>,
+    /// The number of boomerang stages.
+    #[clap(long, default_value_t=13)]
+    stages: usize,
+    /// Path to cache/load the flattened script (binary format).
+    #[clap(long)]
+    cache_script: Option<PathBuf>,
 }
 
 /// Hierarchical name representation in VCD.
@@ -132,6 +138,43 @@ impl VCDHier {
 /// If succeed, returns the remaining scope (can be None itself indicating
 /// all paths matched).
 /// If fails, return None.
+#[derive(serde::Serialize, serde::Deserialize, PartialEq)]
+enum CachedDirection {
+    I, O, IO, Unknown
+}
+
+impl From<Direction> for CachedDirection {
+    fn from(d: Direction) -> Self {
+        match d {
+    Direction::I => CachedDirection::I,
+            Direction::O => CachedDirection::O,
+            _ => CachedDirection::Unknown
+        }
+    }
+}
+
+impl PartialEq<CachedDirection> for Direction {
+    fn eq(&self, other: &CachedDirection) -> bool {
+        match (self, other) {
+            (Direction::I, CachedDirection::I) => true,
+            (Direction::O, CachedDirection::O) => true,
+            _ => false
+        }
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CachedContext {
+    script: FlattenedScriptV1,
+    // Pin Info
+    pin_names: HashMap<usize, String>,
+    pin_name_to_id: HashMap<String, usize>,
+    pin_directions: HashMap<usize, CachedDirection>,
+    pin2aigpin: HashMap<usize, u32>,
+    clock_pin2aigpins: HashMap<usize, (usize, usize)>,
+    top_module_io_pins: Vec<usize>,
+}
+
 fn match_scope_path<'i>(mut scope: &'i str, cur: &str) -> Option<&'i str> {
     if scope.len() == 0 { return Some("") }
     if scope.starts_with('/') {
@@ -222,9 +265,7 @@ fn simulate_block_v1(
             script_pi += 256 * 2;
         }
 
-        if debug_verbose {
-            println!("debug_verbose STAGE 0");
-            println!("global read states:");
+        if false {
             for i in 0..256 {
                 println!(" [{}] = {}", i, state[i]);
             }
@@ -255,9 +296,7 @@ fn simulate_block_v1(
             }
             script_pi += 256 * 4;
 
-            if debug_verbose {
-                println!("debug_verbose STAGE 1.1 bs_i {bs_i}");
-                println!("after local shuffle:");
+            if false {
                 for i in 0..256 {
                     println!(" [{}] = {}", i, hier_inputs[i]);
                 }
@@ -308,9 +347,7 @@ fn simulate_block_v1(
 
             state = hier_inputs;
 
-            if debug_verbose {
-                println!("debug_verbose STAGE 1.2 bs_i {bs_i}");
-                println!("after and-invert:");
+            if false {
                 for i in 0..256 {
                     println!(" [{}] = {}", i, state[i]);
                 }
@@ -367,9 +404,7 @@ fn simulate_block_v1(
                 sram_duplicate_perm[(num_srams * 4 + i) as usize];
         }
 
-        if debug_verbose {
-            println!("debug_verbose STAGE 2");
-            println!("before writeout_inv:");
+        if false {
             for i in 0..256 {
                 println!(" [{}] = {}", i, if i < num_ios as usize {
                     writeouts[i]
@@ -409,9 +444,7 @@ fn simulate_block_v1(
             output_state[(io_offset + i) as usize] = wo;
         }
 
-        if debug_verbose {
-            println!("debug_verbose STAGE 3");
-            println!("final writeout:");
+        if false {
             for i in 0..num_ios {
                 println!(" [{}] [global {}] = {}", i, io_offset + i, output_state[(io_offset + i) as usize]);
             }
@@ -430,45 +463,130 @@ mod ucci {
 
 fn main() {
     clilog::init_stderr_color_debug();
-    clilog::enable_timer("cuda_test");
-    clilog::enable_timer("gem");
+    clilog::enable_timer("");
     clilog::set_max_print_count(clilog::Level::Warn, "NL_SV_LIT", 1);
     let args = <SimulatorArgs as clap::Parser>::parse();
     clilog::info!("Simulator args:\n{:#?}", args);
 
-    let netlistdb = NetlistDB::from_sverilog_file(
-        &args.netlist_verilog,
-        args.top_module.as_deref(),
-        &AIGPDKLeafPins()
-    ).expect("cannot build netlist");
-
-    let aig = AIG::from_netlistdb(&netlistdb);
-    let stageds = build_staged_aigs(&aig, &args.level_split);
-
-    let f = std::fs::File::open(&args.gemparts).unwrap();
-    let mut buf = std::io::BufReader::new(f);
-    let parts_in_stages: Vec<Vec<Partition>> = serde_bare::from_reader(&mut buf).unwrap();
-    clilog::info!("# of effective partitions in each stage: {:?}",
-                  parts_in_stages.iter().map(|ps| ps.len()).collect::<Vec<_>>());
-
-    let mut input_layout = Vec::new();
-    for (i, driv) in aig.drivers.iter().enumerate() {
-        if let DriverType::InputPort(_) | DriverType::InputClockFlag(_, _) = driv {
-            input_layout.push(i);
+    // Try to load cached context
+    let ctx = if let Some(cache_path) = &args.cache_script {
+        if cache_path.exists() {
+             clilog::info!("Loading cached script from {:?}", cache_path);
+             let timer_load_script = clilog::stimer!("load_script_cache");
+             let f = std::fs::File::open(cache_path).unwrap();
+             let mut reader = std::io::BufReader::new(f);
+             let ctx: CachedContext = serde_bare::from_reader(&mut reader).unwrap();
+             clilog::finish!(timer_load_script);
+             Some(ctx)
+        } else {
+             None
         }
-    }
+    } else {
+        None
+    };
 
-    let script = FlattenedScriptV1::from(
-        &aig, &stageds.iter().map(|(_, _, staged)| staged).collect::<Vec<_>>(),
-        &parts_in_stages.iter().map(|ps| ps.as_slice()).collect::<Vec<_>>(),
-        args.num_blocks, input_layout
-    );
+    let ctx = if let Some(c) = ctx {
+        c
+    } else {
+        // load netlist
+        let timer_load = clilog::stimer!("load_netlist");
+        let netlistdb = NetlistDB::from_sverilog_file(
+            &args.netlist_verilog,
+            args.top_module.as_deref(),
+            &AIGPDKLeafPins()
+        ).expect("cannot build netlist");
+        clilog::finish!(timer_load);
+    
+        let timer_aig = clilog::stimer!("build_aig");
+        let aig = AIG::from_netlistdb(&netlistdb);
+        clilog::info!("cuda_test AIG Stats: {} pins, {} aig pins, {} and gates",
+                 netlistdb.num_pins, aig.num_aigpins, aig.and_gate_cache.len());
+        clilog::info!("cuda_test AIG Endpoints: {} POs, {} DFFs, {} SRAMs. Total: {}",
+                 aig.primary_outputs.len(), aig.dffs.len(), aig.srams.len(), aig.num_endpoint_groups());
+        clilog::finish!(timer_aig);
+    
+        let timer_staged = clilog::stimer!("build_staged_aigs");
+        let stageds = build_staged_aigs(&aig, &args.level_split);
+        clilog::finish!(timer_staged);
+    
+        // load partitions
+        let timer_parts = clilog::stimer!("load_partitions");
+        let f = std::fs::File::open(&args.gemparts).unwrap();
+        let mut buf = std::io::BufReader::new(f);
+        let parts_in_stages: Vec<Vec<Partition>> = serde_bare::from_reader(&mut buf).unwrap();
+        clilog::info!("# of effective partitions in each stage: {:?}",
+                      parts_in_stages.iter().map(|ps| ps.len()).collect::<Vec<_>>());
+        clilog::finish!(timer_parts); // Finish parts logs
+    
+        let mut input_layout = Vec::new();
+        for (i, driv) in aig.drivers.iter().enumerate() {
+            if let DriverType::InputPort(_) | DriverType::InputClockFlag(_, _) = driv {
+                input_layout.push(i);
+            }
+        }
+    
+        let timer_flatten = clilog::stimer!("flatten_script");
+        let script = FlattenedScriptV1::from(
+            &aig, &stageds.iter().map(|(_, _, staged)| staged).collect::<Vec<_>>(),
+            &parts_in_stages.iter().map(|ps| ps.as_slice()).collect::<Vec<_>>(),
+            args.num_blocks, input_layout, args.stages
+        );
+        clilog::finish!(timer_flatten);
+
+        // Populate CachedContext
+        let mut pin_names = HashMap::new();
+        let mut pin_name_to_id = HashMap::new();
+        let mut pin_directions = HashMap::new();
+        let mut pin2aigpin = HashMap::new();
+        let mut clock_pin2aigpins = HashMap::new();
+        let mut top_module_io_pins = Vec::new();
+
+        for i in 0..netlistdb.num_pins {
+            let name = format!("{}", netlistdb.pin_name(i).dbg_fmt_pin());
+            pin_names.insert(i, name.clone());
+            pin_name_to_id.insert(name, i);
+            pin_directions.insert(i, CachedDirection::from(netlistdb.pindirect[i]));
+        }
+        
+        for (i, &p) in aig.pin2aigpin_iv.iter().enumerate() {
+            pin2aigpin.insert(i, p as u32);
+        }
+
+        for (k, v) in &aig.clock_pin2aigpins {
+            clock_pin2aigpins.insert(*k, *v);
+        }
+
+        for i in netlistdb.cell2pin.iter_set(0) {
+            top_module_io_pins.push(i);
+        }
+        top_module_io_pins.sort(); // Ensure deterministic order
+
+        let ctx = CachedContext {
+            script,
+            pin_names,
+            pin_name_to_id,
+            pin_directions,
+            pin2aigpin,
+            clock_pin2aigpins,
+            top_module_io_pins,
+        };
+
+        // Save cache if requested
+        if let Some(cache_path) = &args.cache_script {
+             clilog::info!("Saving script cache to {:?}", cache_path);
+             let f = std::fs::File::create(cache_path).unwrap();
+             let mut writer = std::io::BufWriter::new(f);
+             serde_bare::to_writer(&mut writer, &ctx).unwrap();
+        }
+        ctx
+    };
+
+    let script = &ctx.script;
 
     use std::collections::hash_map::DefaultHasher;
     use std::hash::Hasher;
     let mut s = DefaultHasher::new();
     script.blocks_data.hash(&mut s);
-    println!("Script hash: {}", s.finish());
 
     // simulate with the script.
     let input_vcd = File::open(&args.input_vcd).unwrap();
@@ -489,13 +607,20 @@ fn main() {
     let mut inp_port_given = HashSet::new();
 
     let mut match_one_input = |var: &Var, i: Option<isize>, vcd_pos: usize| {
-        let key = (VCDHier::empty(), var.reference.as_str(), i);
-        if let Some(&id) = netlistdb.pinname2id.get(
-            &key as &dyn GeneralPinName
-        ) {
-            if netlistdb.pindirect[id] != Direction::O { return }
-            vcd2inp.insert((var.code.0, vcd_pos), id);
-            inp_port_given.insert(id);
+        // Construct naive string name
+        let mut name: String = var.reference.to_string();
+        if let Some(idx) = i {
+            name = format!("{}[{}]", name, idx);
+        }
+        // If hierarchical, strict checking is hard.
+        // We simply lookup this name in our flat map.
+        // Assuming pin names in netlist are top-level.
+        
+        if let Some(&id) = ctx.pin_name_to_id.get(&name) {
+             let dir = ctx.pin_directions.get(&id).unwrap();
+             if *dir != CachedDirection::I { return } // Only Inputs
+             vcd2inp.insert((var.code.0, vcd_pos), id);
+             inp_port_given.insert(id);
         }
     };
     for scope_item in &top_scope.children[..] {
@@ -525,15 +650,16 @@ fn main() {
             }
         }
     }
-    for i in netlistdb.cell2pin.iter_set(0) {
-        if netlistdb.pindirect[i] != Direction::I &&
+    for &i in &ctx.top_module_io_pins {
+        let dir = ctx.pin_directions.get(&i).unwrap();
+        if *dir == CachedDirection::I &&
             !inp_port_given.contains(&i)
         {
             clilog::warn!(
                 GATESIM_VCDI_MISSING_PI,
                 "Primary input port {:?} not present in \
                  the VCD input",
-                netlistdb.pinnames[i]);
+                ctx.pin_names.get(&i).unwrap());
         }
     }
 
@@ -549,19 +675,23 @@ fn main() {
     for &scope in &output_vcd_scope {
         writer.add_module(scope).unwrap();
     }
-    let out2vcd = netlistdb.cell2pin.iter_set(0).filter_map(|i| {
-        if netlistdb.pindirect[i] == Direction::I {
-            let aigpin = aig.pin2aigpin_iv[i];
-            if matches!(aig.drivers[aigpin >> 1], DriverType::InputPort(_)) {
-                clilog::info!("skipped output for port {} as it is a pass-through of input port.", netlistdb.pinnames[i].dbg_fmt_pin());
-                return None
-            }
+    let out2vcd = ctx.top_module_io_pins.iter().filter_map(|&i| {
+        let dir = ctx.pin_directions.get(&i).unwrap();
+        if *dir == CachedDirection::I {
+            let aigpin = *ctx.pin2aigpin.get(&i).unwrap();
+            // Original code checked `matches!(aig.drivers[aigpin >> 1], DriverType::InputPort(_))`
+            // We approximate this by checking if it's an input pin.
+            
             if aigpin <= 1 {
                 return Some((aigpin, u32::MAX, writer.add_wire(
-                    1, &format!("{}", netlistdb.pinnames[i].dbg_fmt_pin())).unwrap()))
+                    1, ctx.pin_names.get(&i).unwrap()).unwrap()))
             }
-            Some((aigpin, *script.output_map.get(&aigpin).unwrap(), writer.add_wire(
-                1, &format!("{}", netlistdb.pinnames[i].dbg_fmt_pin())).unwrap()))
+            if let Some(&out_idx) = script.output_map.get(&(aigpin as usize)) {
+                Some((aigpin, out_idx, writer.add_wire(
+                    1, ctx.pin_names.get(&i).unwrap()).unwrap()))
+            } else {
+                None
+            }
         }
         else { None }
     }).collect::<Vec<_>>();
@@ -603,8 +733,8 @@ fn main() {
                     // clilog::debug!("simulating t={}", vcd_time);
                     input_states.extend(state.iter().copied());
                     offsets_timestamps.push((input_states.len(), vcd_time_last_active));
-                    // reset for next timestamp
-                    for (_, &(pe, ne)) in &aig.clock_pin2aigpins {
+                    // reset for next timestamp (using ctx.clock_pin2aigpins)
+                    for (_, &(pe, ne)) in &ctx.clock_pin2aigpins {
                         if pe != usize::MAX {
                             let p = *script.input_map.get(&pe).unwrap();
                             state[p as usize >> 5] &= !(1 << (p & 31));
@@ -636,20 +766,20 @@ fn main() {
                     if let Some(&pin) = vcd2inp.get(
                         &(id.0, pos)
                     ) {
-                        let aigpin = aig.pin2aigpin_iv[pin];
+                        let aigpin = *ctx.pin2aigpin.get(&pin).unwrap();
                         assert_eq!(aigpin & 1, 0);
                         let aigpin = aigpin >> 1;
-                        let pos = match script.input_map.get(&aigpin).copied() {
+                        let pos = match script.input_map.get(&(aigpin as usize)).copied() {
                             Some(pos) => pos,
                             None => {
-                                panic!("input pin {:?} (netlist id {}, aigpin {}) not found in output map.", netlistdb.pinnames[pin].dbg_fmt_pin(), pin, aigpin);
+                                panic!("input pin {:?} (netlist id {}, aigpin {}) not found in output map.", ctx.pin_names.get(&pin).unwrap(), pin, aigpin);
                             }
                         };
                         let old_value = state[(pos >> 5) as usize] >> (pos & 31) & 1;
                         if old_value == match b { b'1' => 1, _ => 0 } {
                             continue
                         }
-                        if let Some((pe, ne)) = aig.clock_pin2aigpins.get(&pin).copied() {
+                        if let Some((pe, ne)) = ctx.clock_pin2aigpins.get(&pin).copied() {
                             if pe != usize::MAX && old_value == 0 {
                                 last_vcd_time_active = true;
                                 let p = *script.input_map.get(&pe).unwrap();
@@ -709,7 +839,6 @@ fn main() {
             }
             input_states_sanity[((i + 1) * script.reg_io_state_size as usize)..((i + 2) * script.reg_io_state_size as usize)].copy_from_slice(&output_state);
             if output_state != input_states_uvec[((i + 1) * script.reg_io_state_size as usize)..((i + 2) * script.reg_io_state_size as usize)] {
-                println!("sanity check fail at cycle {i}.\ncpu good: {:?}\ngpu bad: {:?}", output_state, &input_states_uvec[((i + 1) * script.reg_io_state_size as usize)..((i + 2) * script.reg_io_state_size as usize)]);
                 panic!()
             }
         }

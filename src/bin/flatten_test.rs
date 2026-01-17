@@ -4,7 +4,8 @@ use std::path::PathBuf;
 use gem::aigpdk::{AIGPDKLeafPins, AIGPDK_SRAM_SIZE};
 use gem::aig::{DriverType, AIG};
 use gem::staging::build_staged_aigs;
-use gem::pe::{Partition, BOOMERANG_NUM_STAGES};
+use gem::pe::Partition;
+
 use gem::flatten::FlattenedScriptV1;
 use netlistdb::{Direction, GeneralPinName, NetlistDB};
 use sverilogparse::SVerilogRange;
@@ -54,7 +55,11 @@ struct SimulatorArgs {
     /// whether to enable debug shell, after a timestamp.
     #[clap(long)]
     launch_debug_shell_after: Option<u64>,
+    /// The number of boomerang stages.
+    #[clap(long, default_value_t=13)]
+    stages: usize,
 }
+
 
 fn hash_of<T: Hash>(x: &T) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -211,7 +216,8 @@ fn simulate_block_v1(
             hier_inputs[0] = r8 | r9 | r10 | r11 | r12;
 
             // [debug] hier[1..] writeout
-            for hi in 1..=BOOMERANG_NUM_STAGES {
+            for hi in 1..=num_stages as usize {
+
                 for (i, &aigpin) in part.stages[bs_i as usize].hier[hi].iter().enumerate() {
                     if aigpin == usize::MAX { continue }
                     let len = part.stages[bs_i as usize].hier[hi].len();
@@ -454,8 +460,9 @@ fn main() {
     let script = FlattenedScriptV1::from(
         &aig, &stageds.iter().map(|(_, _, staged)| staged).collect::<Vec<_>>(),
         &parts_in_stages.iter().map(|ps| ps.as_slice()).collect::<Vec<_>>(),
-        5, input_layout
+        5, input_layout, args.stages
     );
+
 
     // simulate with the script.
     let input_vcd = File::open(&args.input_vcd).unwrap();
@@ -520,7 +527,7 @@ fn main() {
                 GATESIM_VCDI_MISSING_PI,
                 "Primary input port {:?} not present in \
                  the VCD input",
-                netlistdb.pinnames[i]);
+                netlistdb.pin_name(i));
         }
     }
 
@@ -540,15 +547,15 @@ fn main() {
         if netlistdb.pindirect[i] == Direction::I {
             let aigpin_iv = aig.pin2aigpin_iv[i];
             if matches!(aig.drivers[aigpin_iv >> 1], DriverType::InputPort(_)) {
-                clilog::info!("skipped output for port {} as it is a pass-through of input port.", netlistdb.pinnames[i].dbg_fmt_pin());
+                clilog::info!("skipped output for port {} as it is a pass-through of input port.", netlistdb.pin_name(i).dbg_fmt_pin());
                 return None
             }
             if aigpin_iv <= 1 {
                 return Some((i, aigpin_iv, u32::MAX, writer.add_wire(
-                    1, &format!("{}", netlistdb.pinnames[i].dbg_fmt_pin())).unwrap()))
+                    1, &format!("{}", netlistdb.pin_name(i).dbg_fmt_pin())).unwrap()))
             }
             Some((i, aigpin_iv, *script.output_map.get(&aigpin_iv).unwrap(), writer.add_wire(
-                1, &format!("{}", netlistdb.pinnames[i].dbg_fmt_pin())).unwrap()))
+                1, &format!("{}", netlistdb.pin_name(i).dbg_fmt_pin())).unwrap()))
         }
         else { None }
     }).collect::<Vec<_>>();
@@ -568,7 +575,7 @@ fn main() {
                 return None
             }
             Some((root, aigpin_iv, u32::MAX, writer.add_wire(
-                1, &format!("{}", netlistdb.netnames[i].dbg_fmt_pin())
+                1, &format!("{}", netlistdb.net_name(i).dbg_fmt_pin())
             ).unwrap()))
         }));
     }
@@ -670,7 +677,7 @@ fn main() {
                                 output_pos @ _ => {
                                     let value_new_output = state[(output_pos >> 5) as usize] >> (output_pos & 31) & 1;
                                     if aigpin_value_new <= 1 {
-                                        assert_eq!(value_new_output, aigpin_value_new, "mismatch value: time {vcd_time} aigpin {output_aigpin} netlist_pin {netlist_pin} ({}) pos {output_pos}", netlistdb.pinnames[netlist_pin].dbg_fmt_pin());
+                                        assert_eq!(value_new_output, aigpin_value_new, "mismatch value: time {vcd_time} aigpin {output_aigpin} netlist_pin {netlist_pin} ({}) pos {output_pos}", netlistdb.pin_name(netlist_pin).dbg_fmt_pin());
                                     }
                                     value_new_output
                                 },
@@ -710,18 +717,18 @@ fn main() {
                                 }
                                 let mut found = false;
                                 for net_i in 0..netlistdb.num_nets {
-                                    if netlistdb.netnames[net_i].dbg_fmt_pin().as_str() == line.as_str() {
+                                    if netlistdb.net_name(net_i).dbg_fmt_pin().as_str() == line.as_str() {
                                         found = true;
                                         let root = netlistdb.net2pin.items[netlistdb.net2pin.start[net_i]];
                                         if netlistdb.pindirect[root] != Direction::O {
-                                            println!("net {:?} is undriven", netlistdb.netnames[net_i].dbg_fmt_pin());
+                                            println!("net {:?} is undriven", netlistdb.net_name(net_i).dbg_fmt_pin());
                                             continue
                                         }
                                         let aigpin = aig.pin2aigpin_iv[root];
                                         println!(
                                             "net {:?} driver {:?} (pin {} aigpin_iv {}) last recorded value is {}",
-                                            netlistdb.netnames[net_i].dbg_fmt_pin(),
-                                            netlistdb.pinnames[root].dbg_fmt_pin(),
+                                            netlistdb.net_name(net_i).dbg_fmt_pin(),
+                                            netlistdb.pin_name(root).dbg_fmt_pin(),
                                             root, aigpin,
                                             aigpin_values_debug[aigpin >> 1] ^ ((aigpin & 1) as u8)
                                         );
@@ -758,7 +765,7 @@ fn main() {
                         let pos = match script.input_map.get(&aigpin).copied() {
                             Some(pos) => pos,
                             None => {
-                                panic!("input pin {:?} (netlist id {}, aigpin {}) not found in output map.", netlistdb.pinnames[pin].dbg_fmt_pin(), pin, aigpin);
+                                panic!("input pin {:?} (netlist id {}, aigpin {}) not found in output map.", netlistdb.pin_name(pin).dbg_fmt_pin(), pin, aigpin);
                             }
                         };
                         let old_value = state[(pos >> 5) as usize] >> (pos & 31) & 1;

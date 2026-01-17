@@ -89,6 +89,8 @@ impl RCHyperGraph {
                     ess.bs_set[idx_offset / 64] |= 1 << (idx_offset % 64);
                 });
             }
+            
+            let mut trace_max_pop = 0;
             for order_i in (0..order_blk.len()).rev() {
                 let i = order_blk[order_i];
                 let mut ess =
@@ -103,6 +105,18 @@ impl RCHyperGraph {
                         }
                     }
                 }
+                
+                let cur_pop = ess.bs_set.iter().map(|u| u.count_ones()).sum::<u32>();
+                if cur_pop > trace_max_pop { trace_max_pop = cur_pop; }
+                if cur_pop > 10 {
+                     // println!("Node {} has popcount {}", i, cur_pop);
+                     // Can't easily print name here without AIG/Netlist reference or passing it down.
+                     // But we can verify if it's an Input.
+                     match aig.drivers[i] {
+                         _ => {}
+                     }
+                }
+
                 let ess = Arc::new(
                     CachedHash::new(ess)
                 );
@@ -113,13 +127,18 @@ impl RCHyperGraph {
         });
         // println!("sbn: {:?}", segments_blockid_nodeid);
         let mut clusters = IndexMap::<_, usize>::new();
+        let mut max_pop = 0;
+        let mut count_ge2 = 0;
         for i in 1..aig.num_aigpins {
             let es = CachedHash::new(EndpointSet {
                 s: (0..num_blocks)
                     .map(|k| segments_blockid_nodeid[k][i]
                          .clone()).collect()
             });
-            if es.popcount() >= 2 {
+            let pc = es.popcount();
+            if pc > max_pop { max_pop = pc; }
+            if pc >= 2 {
+                count_ge2 += 1;
                 *clusters.entry(es).or_default() += 1;
             }
         }
@@ -212,7 +231,7 @@ impl RCHyperGraph {
     }
 
     /// Run mt-kahypar to partition this hypergraph.
-    pub fn partition(&self, num_parts: usize) -> Vec<usize> {
+    pub fn partition(&self, num_parts: usize, fast: bool) -> Vec<usize> {
         // Handle the special case where num_parts = 1
         // mt-kahypar requires k >= 2, so we handle k=1 manually
         if num_parts == 1 {
@@ -220,7 +239,7 @@ impl RCHyperGraph {
         }
         
         let ctx = mt_kahypar::Context::builder()
-            .preset(mt_kahypar::Preset::Deterministic)
+            .preset(if fast { mt_kahypar::Preset::Default } else { mt_kahypar::Preset::Deterministic })
             .k(num_parts as i32)
             .epsilon(0.2)
             .objective(mt_kahypar::Objective::Soed)

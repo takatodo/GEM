@@ -166,7 +166,7 @@ fn main() {
         if matches!(netlistdb.celltypes[cellid].as_str(),
                     "DFF" | "$__RAMGEM_SYNC_") {
             for pinid in netlistdb.cell2pin.iter_set(cellid) {
-                if matches!(netlistdb.pinnames[pinid].1.as_str(),
+                if matches!(netlistdb.pin_name(pinid).1.as_str(),
                             "CLK" | "PORT_R_CLK" | "PORT_W_CLK") {
                     let netid = netlistdb.pin2net[pinid];
                     if Some(netid) == netlistdb.net_zero || Some(netid) == netlistdb.net_one {
@@ -178,7 +178,7 @@ fn main() {
                     if netlistdb.pin2cell[root] != 0 {
                         panic!("DFF {} driven by non-port pin {}: this pattern is not yet supported. please disable clock gating.",
                                netlistdb.cellnames[cellid],
-                               netlistdb.pinnames[root].dbg_fmt_pin());
+                               netlistdb.pin_name(root).dbg_fmt_pin());
                     }
                     posedge_monitor.insert(root);
                 }
@@ -188,7 +188,7 @@ fn main() {
     clilog::info!(
         "clock ports detected: {}",
         posedge_monitor.iter()
-            .map(|&i| netlistdb.pinnames[i].dbg_fmt_pin())
+            .map(|&i| netlistdb.pin_name(i).dbg_fmt_pin())
             .format(", "));
 
     let input_vcd = File::open(&args.input_vcd).unwrap();
@@ -253,7 +253,7 @@ fn main() {
                 GATESIM_VCDI_MISSING_PI,
                 "Primary input port {:?} not present in \
                  the VCD input",
-                netlistdb.pinnames[i]);
+                netlistdb.pin_name(i));
         }
     }
 
@@ -277,7 +277,7 @@ fn main() {
         if matches!(netlistdb.celltypes[cellid].as_str(),
                     "DFF" | "$__RAMGEM_SYNC_") {
             for pinid in netlistdb.cell2pin.iter_set(cellid) {
-                if matches!(netlistdb.pinnames[pinid].1.as_str(),
+                if matches!(netlistdb.pin_name(pinid).1.as_str(),
                             "Q" | "PORT_R_RD_DATA") {
                     topo_vis[pinid] = true;
                     // do not add them to topo, but treat them separately before prop.
@@ -307,7 +307,7 @@ fn main() {
         else {
             let cellid = netlistdb.pin2cell[pinid];
             for pinid in netlistdb.cell2pin.iter_set(cellid) {
-                if matches!(netlistdb.pinnames[pinid].1.as_str(),
+                if matches!(netlistdb.pin_name(pinid).1.as_str(),
                             "A" | "B") {
                     dfs_topo(netlistdb, topo_vis, topo_instack, topo, pinid);
                 }
@@ -326,7 +326,7 @@ fn main() {
         if matches!(netlistdb.celltypes[cellid].as_str(),
                     "DFF" | "$__RAMGEM_SYNC_") {
             for pinid in netlistdb.cell2pin.iter_set(cellid) {
-                if matches!(netlistdb.pinnames[pinid].1.as_str(),
+                if matches!(netlistdb.pin_name(pinid).1.as_str(),
                             "D" | "PORT_R_ADDR" | "PORT_W_WR_EN" | "PORT_W_ADDR" | "PORT_W_WR_DATA") {
                     dfs_topo(&netlistdb, &mut topo_vis, &mut topo_instack, &mut topo, pinid);
                 }
@@ -336,15 +336,15 @@ fn main() {
     for &clk in &posedge_monitor {
         if topo_vis[clk] {
             clilog::error!("Clock {} is also used in combinational logic. This is unsupported and might lead to error.",
-                           netlistdb.pinnames[clk].dbg_fmt_pin());
+                           netlistdb.pin_name(clk).dbg_fmt_pin());
         }
     }
     // clilog::info!("topo size: {} / {}", topo.len(), netlistdb.num_pins);
 
     // for i in 0..netlistdb.num_pins {
-    //     if netlistdb.pinnames[i].0.cur.as_str() == "_46841_" {
+    //     if netlistdb.pin_name(i).0.cur.as_str() == "_46841_" {
     //         println!("pin _01039_ ({}) id {} net {}",
-    //                  netlistdb.pinnames[i].dbg_fmt_pin(), i,
+    //                  netlistdb.pin_name(i).dbg_fmt_pin(), i,
     //                  netlistdb.pin2net[i]);
     //     }
     // }
@@ -364,7 +364,7 @@ fn main() {
     let mut out2vcd = netlistdb.cell2pin.iter_set(0).filter_map(|i| {
         if netlistdb.pindirect[i] == Direction::I {
             Some((i, writer.add_wire(
-                1, &format!("{}", netlistdb.pinnames[i].dbg_fmt_pin())).unwrap()))
+                1, &format!("{}", netlistdb.pin_name(i).dbg_fmt_pin())).unwrap()))
         }
         else { None }
     }).collect::<Vec<_>>();
@@ -378,7 +378,7 @@ fn main() {
                 return None
             }
             Some((root, writer.add_wire(
-                1, &format!("{}", netlistdb.netnames[i].dbg_fmt_pin())
+                1, &format!("{}", netlistdb.net_name(i).dbg_fmt_pin())
             ).unwrap()))
         }));
     }
@@ -404,7 +404,7 @@ fn main() {
                             let mut pinid_d = usize::MAX;
                             let mut pinid_q = usize::MAX;
                             for pinid in netlistdb.cell2pin.iter_set(cellid) {
-                                match netlistdb.pinnames[pinid].1.as_str() {
+                                match netlistdb.pin_name(pinid).1.as_str() {
                                     "D" => pinid_d = pinid,
                                     "Q" => pinid_q = pinid,
                                     _ => {}
@@ -421,9 +421,9 @@ fn main() {
                             for pinid in netlistdb.cell2pin.iter_set(cellid) {
                                 macro_rules! load_var {
                                     ($($pin_name:literal => $var_name:ident),+) => {
-                                        match netlistdb.pinnames[pinid].1.as_str() {
+                                        match netlistdb.pin_name(pinid).1.as_str() {
                                             $($pin_name => {
-                                                $var_name = ($var_name as u64 | ((circ_state[pinid] as u64) << netlistdb.pinnames[pinid].2.unwrap())).try_into().unwrap();
+                                                $var_name = ($var_name as u64 | ((circ_state[pinid] as u64) << netlistdb.pin_name(pinid).2.unwrap())).try_into().unwrap();
                                             }),+,
                                             _ => {}
                                         }
@@ -446,9 +446,9 @@ fn main() {
                             for pinid in netlistdb.cell2pin.iter_set(cellid) {
                                 macro_rules! save_var {
                                     ($($pin_name:literal <= $var_name:ident),+) => {
-                                        match netlistdb.pinnames[pinid].1.as_str() {
+                                        match netlistdb.pin_name(pinid).1.as_str() {
                                             $($pin_name => {
-                                                circ_state[pinid] = ($var_name >> netlistdb.pinnames[pinid].2.unwrap() & 1) as u8;
+                                                circ_state[pinid] = ($var_name >> netlistdb.pin_name(pinid).2.unwrap() & 1) as u8;
                                             }),+,
                                             _ => {}
                                         }
@@ -463,7 +463,7 @@ fn main() {
                     // propagate
                     for &pinid in &topo {
                         // if netlistdb.pin2cell[pinid] == 0 {
-                        //     println!("trying to visit port {}", netlistdb.pinnames[pinid].dbg_fmt_pin());
+                        //     println!("trying to visit port {}", netlistdb.pin_name(pinid).dbg_fmt_pin());
                         // }
                         if netlistdb.pindirect[pinid] == Direction::I {
                             let netid = netlistdb.pin2net[pinid];
@@ -473,7 +473,7 @@ fn main() {
                                 ];
                                 circ_state[pinid] = circ_state[root];
                                 // if netlistdb.pin2cell[pinid] == 0 {
-                                //     println!("changing output for pin {} to {}", netlistdb.pinnames[pinid].dbg_fmt_pin(), circ_state[pinid]);
+                                //     println!("changing output for pin {} to {}", netlistdb.pin_name(pinid).dbg_fmt_pin(), circ_state[pinid]);
                                 // }
                             }
                         }
@@ -482,7 +482,7 @@ fn main() {
                             let mut vala = 0;
                             let mut valb = 0;
                             for pinid_inp in netlistdb.cell2pin.iter_set(cellid) {
-                                match netlistdb.pinnames[pinid_inp].1.as_str() {
+                                match netlistdb.pin_name(pinid_inp).1.as_str() {
                                     "A" => vala = circ_state[pinid_inp],
                                     "B" => valb = circ_state[pinid_inp],
                                     "Y" => {},

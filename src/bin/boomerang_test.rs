@@ -33,6 +33,9 @@ struct SimulatorArgs {
     /// By default is 0, meaning no degradation is allowed.
     #[clap(long, default_value_t=0)]
     max_stage_degrad: usize,
+    /// The number of boomerang stages.
+    #[clap(long, default_value_t=13)]
+    stages: usize,
 }
 
 fn main() {
@@ -60,7 +63,7 @@ fn main() {
         }, suffix);
         let effective_parts = process_partitions_from_hgr_parts_file(
             &aig, staged, &args.parts_dir.join(&filename),
-            args.max_stage_degrad,
+            args.max_stage_degrad, args.stages,
         ).expect("some partition failed to map. please increase granularity.");
 
         clilog::info!("# of effective partitions in {}: {}", filename, effective_parts.len());

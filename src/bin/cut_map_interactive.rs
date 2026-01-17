@@ -13,10 +13,11 @@ use gem::aig::AIG;
 use gem::staging::build_staged_aigs;
 use gem::pe::{process_partitions, Partition};
 use netlistdb::NetlistDB;
+use netlistdb::GeneralHierName;
 use rayon::prelude::*;
 
 /// Call builtin partitioner.
-fn run_par(hg: &RCHyperGraph, num_parts: usize) -> Vec<Vec<usize>> {
+fn run_par(hg: &RCHyperGraph, num_parts: usize, fast: bool) -> Vec<Vec<usize>> {
     clilog::debug!("invoking partitioner (#parts {})", num_parts);
 	// Handle the special case where num_parts = 1
     // mt-kahypar requires k >= 2, so we handle k=1 manually
@@ -29,7 +30,7 @@ fn run_par(hg: &RCHyperGraph, num_parts: usize) -> Vec<Vec<usize>> {
         return parts;
     }
 	
-    let parts_ids = hg.partition(num_parts);
+    let parts_ids = hg.partition(num_parts, fast);
     let mut parts = vec![vec![]; num_parts];
     for (i, part_id) in parts_ids.into_iter().enumerate() {
         parts[part_id].push(i);
@@ -59,10 +60,17 @@ struct SimulatorArgs {
     /// By default is 0, meaning no degradation is allowed.
     #[clap(long, default_value_t=0)]
     max_stage_degrad: usize,
+    /// The number of boomerang stages.
+    #[clap(long, default_value_t=13)]
+    stages: usize,
+    /// Use fast (high-speed) partitioning instead of search-heavy quality/deterministic mode.
+    #[clap(long, default_value_t=false)]
+    fast_part: bool,
 }
 
 fn main() {
     clilog::init_stderr_color_debug();
+    clilog::enable_timer("");
     clilog::set_max_print_count(clilog::Level::Warn, "NL_SV_LIT", 1);
     let args = <SimulatorArgs as clap::Parser>::parse();
     clilog::info!("Simulator args:\n{:#?}", args);
@@ -74,7 +82,7 @@ fn main() {
     ).expect("cannot build netlist");
 
     let aig = AIG::from_netlistdb(&netlistdb);
-    println!("netlist has {} pins, {} aig pins, {} and gates",
+    clilog::info!("netlist has {} pins, {} aig pins, {} and gates",
              netlistdb.num_pins, aig.num_aigpins, aig.and_gate_cache.len());
 
     let stageds = build_staged_aigs(&aig, &args.level_split);
@@ -90,21 +98,27 @@ fn main() {
         let mut unrealized_endpoints = (0..staged.num_endpoint_groups()).collect::<Vec<_>>();
         let mut division = 600;
 
+        let timer_interactive_stage = clilog::stimer!("interactive_stage_loop");
         while !unrealized_endpoints.is_empty() {
+
             division = (division / 2).max(1);
             let num_parts = (unrealized_endpoints.len() + division - 1) / division;
             clilog::info!("current: {} endpoints, try {} parts", unrealized_endpoints.len(), num_parts);
             let staged_ur = staged.to_endpoint_subset(&unrealized_endpoints);
             let hg_ur = RCHyperGraph::from_staged_aig(&aig, &staged_ur);
-            let mut parts_indices = run_par(&hg_ur, num_parts);
+            let timer_hg_part = clilog::stimer!("hg_partitioning");
+            let mut parts_indices = run_par(&hg_ur, num_parts, args.fast_part);
+            clilog::finish!(timer_hg_part);
             for idcs in &mut parts_indices {
                 for i in idcs {
                     *i = unrealized_endpoints[*i];
                 }
             }
+            let timer_part_build = clilog::stimer!("partition_build_ones");
             let parts_try = parts_indices.par_iter()
-                .map(|endpts| Partition::build_one(&aig, staged, endpts))
+                .map(|endpts| Partition::build_one(&aig, staged, endpts, args.stages))
                 .collect::<Vec<_>>();
+            clilog::finish!(timer_part_build);
             let mut new_unrealized_endpoints = Vec::new();
             for (idx, part_opt) in parts_indices.into_iter().zip(parts_try.into_iter()) {
                 match part_opt {
@@ -113,7 +127,43 @@ fn main() {
                     }
                     None => {
                         if idx.len() == 1 {
-                            panic!("A single endpoint still cannot map, you need to increase level cut granularity.");
+                            let endpt_id = idx[0];
+                            // Map endpoint (EndpointGroup index) to AIG pin
+                            // stagedAIG.get_endpoint_group(aig, endpt_id)
+                            let edg = staged.get_endpoint_group(&aig, endpt_id);
+                            // We can iterate inputs of the endpoint group to find a pin.
+                            // Assuming typical endpoint is one pin.
+                            // Format name based on EndpointGroup type
+                            let edg_name = match edg {
+                                gem::aig::EndpointGroup::PrimaryOutput(pin) => {
+                                    let logic_pin = aig.pin_map[pin >> 1];
+                                    if logic_pin != usize::MAX {
+                                        let (h, n, i) = netlistdb.pin_name(logic_pin);
+                                        format!("PO({}/{}{:?})", h, n, i)
+                                    } else {
+                                        format!("PO(AIG:{})", pin >> 1)
+                                    }
+                                },
+                                gem::aig::EndpointGroup::DFF(dff) => {
+                                    let aig_pin_idx = dff.q;
+                                    let logic_pin = aig.pin_map[aig_pin_idx];
+                                    if logic_pin != usize::MAX {
+                                        let (h, n, i) = netlistdb.pin_name(logic_pin);
+                                        format!("DFF({}/{}{:?})", h, n, i)
+                                    } else {
+                                        // Try to find cell name from driver
+                                        if let gem::aig::DriverType::DFF(cellid) = aig.drivers[aig_pin_idx] {
+                                            format!("DFF(Cell:{})", netlistdb.cellnames[cellid].dbg_fmt_hier())
+                                        } else {
+                                            format!("DFF(AIG:{})", aig_pin_idx)
+                                        }
+                                    }
+                                },
+                                gem::aig::EndpointGroup::RAMBlock(_) => "RAM".to_string(),
+                                gem::aig::EndpointGroup::StagedIOPin(pin) => format!("StagedIO({})", pin),
+                            };
+                            
+                            panic!("A single endpoint still cannot map: endpoint_id={} name={}. You need to increase level cut granularity.", endpt_id, edg_name);
                         }
                         for endpt_i in idx {
                             new_unrealized_endpoints.push(endpt_i);
@@ -125,12 +175,15 @@ fn main() {
             unrealized_endpoints = new_unrealized_endpoints;
         }
 
+        clilog::finish!(timer_interactive_stage);
         clilog::info!("interactive partition completed: {} in total. merging started.",
                       parts_indices_good.len());
 
+        let timer_merging = clilog::stimer!("partition_merging");
         let effective_parts = process_partitions(
-            &aig, staged, parts_indices_good, args.max_stage_degrad
+            &aig, staged, parts_indices_good, args.max_stage_degrad, args.stages
         ).unwrap();
+        clilog::finish!(timer_merging);
         clilog::info!("after merging: {} parts.", effective_parts.len());
         effective_parts
     }).collect::<Vec<_>>();
