@@ -2,3 +2,12 @@
 /Cargo.lock
 /compile_commands.json
 .cache
+fake_cuda_root/
+gem_work/
+*.log
+accelerators/scratch/
+.cargo/
+build_cuda_fake.sh
+setup_env.sh
+run.sh
+src/bin/naive_server.rs
